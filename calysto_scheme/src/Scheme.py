@@ -33,6 +33,9 @@ sys.ps2 = "...: "
 
 PY3 = sys.version_info[0] == 3
 
+# Increase recursion limit for direct-eval fast path (deep Scheme recursion)
+sys.setrecursionlimit(max(10000, sys.getrecursionlimit()))
+
 __version__ = "1.4.9"
 
 #############################################################
@@ -511,31 +514,660 @@ def vector_length(vec):
 ### Native make- functions:
 
 def make_proc(*args):
-    return List(symbol_procedure, *args)
+    return (symbol_procedure,) + args
 
 def make_macro(*args):
-    return List(symbol_macro_transformer, *args)
+    return (symbol_macro_transformer,) + args
 
 def make_cont(*args):
-    return List(symbol_continuation, *args)
+    return (symbol_continuation,) + args
 
 def make_cont2(*args):
-    return List(symbol_continuation2, *args)
+    return (symbol_continuation2,) + args
 
 def make_cont3(*args):
-    return List(symbol_continuation3, *args)
+    return (symbol_continuation3,) + args
 
 def make_cont4(*args):
-    return List(symbol_continuation4, *args)
+    return (symbol_continuation4,) + args
 
 def make_fail(*args):
-    return List(symbol_fail_continuation, *args)
+    return (symbol_fail_continuation,) + args
 
 def make_handler(*args):
-    return List(symbol_handler, *args)
+    return (symbol_handler,) + args
 
 def make_handler2(*args):
-    return List(symbol_handler2, *args)
+    return (symbol_handler2,) + args
+
+### Native apply dispatch functions (tuple-based):
+
+def apply_cont():
+    k_reg[1](*k_reg[2:])
+
+def apply_cont2():
+    k_reg[1](*k_reg[2:])
+
+def apply_cont3():
+    k_reg[1](*k_reg[2:])
+
+def apply_cont4():
+    k_reg[1](*k_reg[2:])
+
+def apply_fail():
+    fail_reg[1](*fail_reg[2:])
+
+def apply_handler():
+    handler_reg[1](*handler_reg[2:])
+
+def apply_handler2():
+    handler_reg[1](*handler_reg[2:])
+
+def apply_proc():
+    if (isinstance(proc_reg, tuple) and len(proc_reg) == 6
+            and proc_reg[1] is b_proc_1_d and proc_reg[5]):
+        bodies, formals, cenv = proc_reg[2], proc_reg[3], proc_reg[4]
+        _args = args_reg
+        _k2   = k2_reg
+        _fail = fail_reg
+        try:
+            n = length(formals)
+            if n != length(_args):
+                raise _TrampolineFallback()
+            new_env = extend(cenv, formals, _args, make_empty_docstrings(n))
+            result = _eval_sequence_direct(bodies, new_env)
+            GLOBALS['value2_reg'] = _fail
+            GLOBALS['value1_reg'] = result
+            GLOBALS['k_reg'] = _k2
+            GLOBALS['pc'] = apply_cont2
+            return
+        except _TrampolineFallback:
+            GLOBALS['args_reg'] = _args   # restore for b_proc_1_d trampoline fallback
+            GLOBALS['k2_reg']   = _k2
+            GLOBALS['fail_reg'] = _fail
+    proc_reg[1](*proc_reg[2:])
+
+def apply_macro():
+    macro_reg[1](*macro_reg[2:])
+
+### Direct eval fast path for user closures:
+
+class _TrampolineFallback(Exception):
+    pass
+
+def _is_direct_eval_safe(bodies):
+    """True iff bodies contain no assign_aexp (set!) at any depth.
+    Stops recursion at inner lambda boundaries (they get their own analysis)."""
+    def _safe(exp):
+        if not isinstance(exp, cons):
+            return True
+        tag = exp.car
+        if tag is symbol_assign_aexp:
+            return False
+        # Inner lambdas are separate closures — don't recurse into them
+        if tag is symbol_lambda_aexp or tag is symbol_mu_lambda_aexp:
+            return True
+        cur = exp.cdr
+        while isinstance(cur, cons):
+            if not _safe(cur.car):
+                return False
+            cur = cur.cdr
+        return True
+    cur = bodies
+    while isinstance(cur, cons):
+        if not _safe(cur.car):
+            return False
+        cur = cur.cdr
+    return True
+
+def _extend_direct(env, formals, args_list):
+    """Extend environment from a Python list of arg values — no cons list construction."""
+    bindings = []
+    cache = {}
+    vars_cur = formals
+    for val in args_list:
+        b = cons(val, "")
+        bindings.append(b)
+        cache[vars_cur.car] = b
+        vars_cur = vars_cur.cdr
+    frame = cons(Vector(bindings), cons(formals, symbol_emptylist))
+    frame._search_cache = cache
+    return cons(symbol_environment, cons(frame, env.cdr))
+
+def _eval_direct(exp, env):
+    """Direct recursive AST interpreter. Raises _TrampolineFallback for unhandled cases."""
+    global _fast_prim_map
+    while True:
+        tag = exp.car
+        if tag is symbol_lit_aexp:
+            return exp.cdr.car
+        elif tag is symbol_lexical_address_aexp:
+            d   = exp.cdr.car
+            off = exp.cdr.cdr.car
+            return binding_value(
+                vector_ref(frame_bindings(list_ref(frames(env), d)), off))
+        elif tag is symbol_var_aexp:
+            b = search_env(env, exp.cdr.car)
+            if b is False:
+                raise _TrampolineFallback()
+            return binding_value(b)
+        elif tag is symbol_if_aexp:
+            test = _eval_direct(exp.cdr.car, env)
+            if test is not False:
+                exp = exp.cdr.cdr.car       # tail: loop with then-branch
+            else:
+                exp = exp.cdr.cdr.cdr.car   # tail: loop with else-branch
+        elif tag is symbol_lambda_aexp:
+            return closure(exp.cdr.car, exp.cdr.cdr.car, env)
+        elif tag is symbol_begin_aexp:
+            return _eval_sequence_direct(exp.cdr, env)
+        elif tag is symbol_app_aexp:
+            op   = _eval_direct(exp.cdr.car, env)
+            args = []
+            cur  = exp.cdr.cdr.car
+            while isinstance(cur, cons):
+                args.append(_eval_direct(cur.car, env))
+                cur = cur.cdr
+            # Inline _apply_direct for speed:
+            if isinstance(op, tuple) and op[0] is symbol_procedure:
+                fn = op[1]
+                if _fast_prim_map is None:
+                    _fast_prim_map = _build_fast_prim_map()
+                direct = _fast_prim_map.get(fn)
+                if direct is not None:
+                    return direct(args)
+                if len(op) == 6 and fn is b_proc_1_d and op[5]:
+                    pid = id(op)
+                    jit_fn = _jit_lookup(op)
+                    if jit_fn is None:
+                        _jit_compile_proc(op)
+                        jit_fn = _jit_lookup(op)
+                    if jit_fn:
+                        return jit_fn(*args)
+                    new_env = _extend_direct(op[4], op[3], args)
+                    return _eval_sequence_direct(op[2], new_env)
+                raise _TrampolineFallback()
+            elif dlr_proc_q(op):
+                return dlr_apply(op, List(*args))
+            raise _TrampolineFallback()
+        else:
+            raise _TrampolineFallback()
+
+## ===== JIT: compile safe Scheme closures to Python functions =====
+
+def _jit_mangle(sym):
+    """Scheme name → valid Python identifier (prefixed _j_ to avoid collisions)."""
+    s = sym.name if isinstance(sym, Symbol) else str(sym)
+    s = (s.replace('->', '_to_').replace('-', '_').replace('?', '_q')
+          .replace('!', '_b').replace('+', '_add').replace('*', '_mul')
+          .replace('/', '_div').replace('<', '_lt').replace('>', '_gt')
+          .replace('=', '_eq'))
+    if s and s[0].isdigit():
+        s = '_' + s
+    return '_j_' + s
+
+_jit_cache = {}   # id(proc_tuple) → (proc, compiled_fn) or (proc, False)
+
+def _jit_lookup(proc):
+    """Return the cached compiled function for proc, or None if not compiled/failed.
+    Validates that the cached id wasn't reused after GC."""
+    entry = _jit_cache.get(id(proc))
+    if entry is None:
+        return None           # not yet attempted
+    cached_proc, result = entry
+    if cached_proc is not proc:
+        del _jit_cache[id(proc)]  # stale — id was reused after GC
+        return None
+    return result if result is not False else None
+
+def _jit_compile_proc(proc):
+    """Try to JIT-compile a safe Scheme closure.
+    Sets _jit_cache[id(proc)] and returns the compiled fn or None."""
+    pid = id(proc)
+    formals, bodies, cenv = proc[3], proc[2], proc[4]
+    params = []
+    cur = formals
+    while isinstance(cur, cons):
+        params.append(cur.car.name)
+        cur = cur.cdr
+    self_ref = [None]   # forward-reference cell for self-recursive calls
+    free = {}           # name → value captured into the exec() namespace
+    try:
+        jc = _JitCompiler(proc, params, cenv, free, self_ref)
+        body_srcs = []
+        cur = bodies
+        while isinstance(cur, cons):
+            body_srcs.append(jc.expr(cur.car))
+            cur = cur.cdr
+        ps = ', '.join(_jit_mangle(p) for p in params)
+        lines = ['def _jit_fn(' + ps + '):']
+        for i, src in enumerate(body_srcs):
+            lines.append(('    return ' if i == len(body_srcs) - 1 else '    ') + src)
+        fn_src = '\n'.join(lines)
+        ns = dict(free)
+        ns['__builtins__'] = __builtins__
+        exec(compile(fn_src, '<scheme-jit>', 'exec'), ns)
+        fn = ns['_jit_fn']
+        self_ref[0] = fn
+        _jit_cache[pid] = (proc, fn)
+        return fn
+    except _TrampolineFallback:
+        _jit_cache[pid] = (proc, False)
+        return None
+    except Exception:
+        _jit_cache[pid] = (proc, False)
+        return None
+
+class _JitCompiler:
+    """Walks Scheme annotated-AST nodes and emits Python source strings."""
+
+    # Arithmetic: n-ary left-associative (matches Scheme semantics)
+    _NARY  = {'+': '+', '-': '-', '*': '*'}
+    # Binary comparisons
+    _CMP   = {'<': '<', '>': '>', '<=': '<=', '>=': '>=', '=': '=='}
+    # Unary — {0} substituted with the single compiled argument string
+    _UNARY = {
+        'not':   '({0} is False)',
+        'zero?': '({0} == 0)',
+        'even?': '({0} % 2 == 0)',
+        'odd?':  '({0} % 2 != 0)',
+        'car':   '({0}).car',
+        'cdr':   '({0}).cdr',
+        'abs':   'abs({0})',
+        'null?': '({0} is _j__empty)',
+        'pair?': 'isinstance({0}, _j__cons)',
+    }
+
+    def __init__(self, self_proc, params, env, free, self_ref):
+        self._self  = self_proc
+        self._pset  = set(_jit_mangle(p) for p in params)
+        self._env   = env
+        self._free  = free
+        self._sref  = self_ref
+
+    def expr(self, exp):
+        if not isinstance(exp, cons):
+            raise _TrampolineFallback()
+        tag = exp.car
+
+        if tag is symbol_lit_aexp:
+            val = exp.cdr.car
+            if isinstance(val, (int, float, bool, str)):
+                return repr(val)
+            raise _TrampolineFallback()
+
+        elif tag is symbol_lexical_address_aexp:
+            # layout: (tag depth offset name info)
+            # depth=0 → local parameter; depth>0 → free var in captured env
+            depth  = exp.cdr.car
+            offset = exp.cdr.cdr.car
+            name   = exp.cdr.cdr.cdr.car
+            m = _jit_mangle(name)
+            if depth == 0:
+                return m   # local parameter — already in function signature
+            # Outer frame: look up actual value and capture into free
+            if m not in self._free:
+                try:
+                    # depth 1 → frames(cenv)[0], depth 2 → frames(cenv)[1], …
+                    frm = list_ref(frames(self._env), depth - 1)
+                    val = binding_value(vector_ref(frame_bindings(frm), offset))
+                except Exception:
+                    raise _TrampolineFallback()
+                self._capture(m, val)
+            return m
+
+        elif tag is symbol_var_aexp:
+            return self._var(exp.cdr.car)
+
+        elif tag is symbol_if_aexp:
+            # layout: (tag test then else info)
+            test = self.expr(exp.cdr.car)
+            then = self.expr(exp.cdr.cdr.car)
+            els  = self.expr(exp.cdr.cdr.cdr.car)
+            return f'({then} if ({test}) is not False else {els})'
+
+        elif tag is symbol_app_aexp:
+            # layout: (tag op args-list info)
+            return self._app(exp.cdr.car, exp.cdr.cdr.car)
+
+        else:
+            raise _TrampolineFallback()
+
+    def _sym_name(self, op_exp):
+        """Extract the Scheme symbol name from a lex-addr or var operator node."""
+        if not isinstance(op_exp, cons):
+            return None
+        if op_exp.car is symbol_lexical_address_aexp:
+            s = op_exp.cdr.cdr.cdr.car
+            return s.name if isinstance(s, Symbol) else None
+        if op_exp.car is symbol_var_aexp:
+            s = op_exp.cdr.car
+            return s.name if isinstance(s, Symbol) else None
+        return None
+
+    def _app(self, op_exp, arg_list):
+        args = []
+        cur = arg_list
+        while isinstance(cur, cons):
+            args.append(self.expr(cur.car))
+            cur = cur.cdr
+        n   = len(args)
+        sym = self._sym_name(op_exp)
+
+        if sym:
+            # n-ary arithmetic (left-assoc)
+            if sym in self._NARY:
+                op = self._NARY[sym]
+                if n == 0:
+                    return '0' if sym == '+' else '1'
+                if n == 1 and sym == '-':
+                    return f'(-{args[0]})'
+                return '(' + f' {op} '.join(args) + ')'
+            # binary comparisons
+            if sym in self._CMP and n == 2:
+                return f'({args[0]} {self._CMP[sym]} {args[1]})'
+            # unary with inline template
+            if sym in self._UNARY and n == 1:
+                if sym == 'null?':
+                    self._free['_j__empty'] = symbol_emptylist
+                elif sym == 'pair?':
+                    self._free['_j__cons'] = cons
+                return self._UNARY[sym].format(args[0])
+
+        # If the operator is a local parameter (depth=0), we can't know at
+        # compile time whether it'll be a Python callable or a Scheme proc
+        # tuple — refuse to JIT this function.
+        if (isinstance(op_exp, cons) and
+                op_exp.car is symbol_lexical_address_aexp and
+                op_exp.cdr.car == 0):
+            raise _TrampolineFallback()
+
+        # General call: compile operator as expression and emit a call
+        op_src = self.expr(op_exp)
+        return f'{op_src}({", ".join(args)})'
+
+    def _var(self, sym):
+        """Handle var-aexp: local param or captured free variable."""
+        m = _jit_mangle(sym)
+        if m in self._pset or m in self._free:
+            return m
+        b = search_env(self._env, sym)
+        if b is False:
+            raise _TrampolineFallback()
+        self._capture(m, binding_value(b))
+        return m
+
+    def _capture(self, m, val):
+        """Add a free-variable value to self._free, or raise _TrampolineFallback."""
+        if val is self._self:
+            # Self-recursive: wrap the forward-ref cell as a callable
+            sref = self._sref
+            self._free[m] = lambda *a, _r=sref: _r[0](*a)
+            return
+        if isinstance(val, tuple) and val[0] is symbol_procedure:
+            pid = id(val)
+            jit_fn = _jit_lookup(val)
+            if jit_fn is not None:
+                self._free[m] = jit_fn
+                return
+            # Wrap a fast_prim_map entry (list interface → positional interface)
+            if _fast_prim_map is not None:
+                direct = _fast_prim_map.get(val[1])
+                if direct is not None:
+                    self._free[m] = lambda *a, _d=direct: _d(list(a))
+                    return
+            raise _TrampolineFallback()
+        # Plain value (number, string, bool…) — capture directly
+        if isinstance(val, (int, float, bool, str)):
+            self._free[m] = val
+            return
+        raise _TrampolineFallback()
+
+## Fast prim map: proc[1] function -> Python callable.
+## Built lazily on first use from the live toplevel environment.
+_fast_prim_map = None
+
+def _build_fast_prim_map():
+    """Populate the fast prim map by resolving known symbol names in toplevel_env."""
+    result = {}
+
+    def _direct_map(args):
+        f, lst = args[0], args[1]
+        items = []
+        while isinstance(lst, cons):
+            items.append(_apply_direct(f, [lst.car]))
+            lst = lst.cdr
+        out = symbol_emptylist
+        for v in reversed(items):
+            out = cons(v, out)
+        return out
+
+    def _direct_for_each(args):
+        f, lst = args[0], args[1]
+        while isinstance(lst, cons):
+            _apply_direct(f, [lst.car])
+            lst = lst.cdr
+        return void_value
+
+    def _set_car(args):
+        args[0].car = args[1]
+        return void_value
+
+    def _set_cdr(args):
+        args[0].cdr = args[1]
+        return void_value
+
+    name_to_direct = {
+        # Arithmetic
+        '+':     lambda args: plus(*args),
+        '-':     lambda args: minus(*args),
+        '*':     lambda args: multiply(*args),
+        '/':     lambda args: divide(*args),
+        # Numeric comparisons
+        '<':     lambda args: LessThan(*args),
+        '>':     lambda args: GreaterThan(*args),
+        '<=':    lambda args: LessThanEqual(*args),
+        '>=':    lambda args: GreaterThanEqual(*args),
+        '=':     lambda args: numeric_equal(*args),
+        # Logic
+        'not':   lambda args: (args[0] is False),
+        # Numeric predicates / math
+        'zero?':     lambda args: (args[0] == 0),
+        'even?':     lambda args: even_q(args[0]),
+        'odd?':      lambda args: odd_q(args[0]),
+        'abs':       lambda args: abs(args[0]),
+        'min':       lambda args: min(*args),
+        'max':       lambda args: max(*args),
+        'modulo':    lambda args: modulo(args[0], args[1]),
+        'remainder': lambda args: remainder(args[0], args[1]),
+        'quotient':  lambda args: quotient(args[0], args[1]),
+        'expt':      lambda args: expt_native(args[0], args[1]),
+        'sqrt':      lambda args: sqrt(args[0]),
+        'round':     lambda args: round(args[0]),
+        # Type predicates
+        'null?':      lambda args: (args[0] is symbol_emptylist),
+        'pair?':      lambda args: pair_q(args[0]),
+        'number?':    lambda args: number_q(args[0]),
+        'string?':    lambda args: string_q(args[0]),
+        'symbol?':    lambda args: symbol_q(args[0]),
+        'char?':      lambda args: char_q(args[0]),
+        'boolean?':   lambda args: boolean_q(args[0]),
+        'vector?':    lambda args: vector_q(args[0]),
+        'list?':      lambda args: list_q(args[0]),
+        'procedure?': lambda args: procedure_q(args[0]),
+        # Equality
+        'eq?':    lambda args: eq_q(args[0], args[1]),
+        'eqv?':   lambda args: eqv_q(args[0], args[1]),
+        'equal?': lambda args: equal_q(args[0], args[1]),
+        # Pair / list construction and access
+        'car':    lambda args: args[0].car,
+        'cdr':    lambda args: args[0].cdr,
+        'cons':   lambda args: cons(args[0], args[1]),
+        'set-car!': _set_car,
+        'set-cdr!': _set_cdr,
+        'caar':   lambda args: args[0].car.car,
+        'cadr':   lambda args: args[0].cdr.car,
+        'cdar':   lambda args: args[0].car.cdr,
+        'cddr':   lambda args: args[0].cdr.cdr,
+        'cadar':  lambda args: args[0].car.cdr.car,
+        'caddr':  lambda args: args[0].cdr.cdr.car,
+        'cdddr':  lambda args: args[0].cdr.cdr.cdr,
+        'cadddr': lambda args: args[0].cdr.cdr.cdr.car,
+        # List operations
+        'list':      lambda args: List(*args),
+        'length':    lambda args: length(args[0]),
+        'reverse':   lambda args: reverse(args[0]),
+        'append':    lambda args: append(*args),
+        'list-ref':  lambda args: list_ref(args[0], args[1]),
+        # Search
+        'memq':   lambda args: memq(args[0], args[1]),
+        'memv':   lambda args: memv(args[0], args[1]),
+        'member': lambda args: member(args[0], args[1]),
+        'assq':   lambda args: assq(args[0], args[1]),
+        'assv':   lambda args: assv(args[0], args[1]),
+        # Vector operations
+        'make-vector':   lambda args: make_vector(args[0]),
+        'vector-ref':    lambda args: vector_ref(args[0], args[1]),
+        'vector-set!':   lambda args: (vector_set_b(args[0], args[1], args[2]), void_value)[1],
+        'vector-length': lambda args: vector_length(args[0]),
+        'vector->list':  lambda args: vector_to_list(args[0]),
+        'list->vector':  lambda args: list_to_vector(args[0]),
+        # String operations
+        'string-length':  lambda args: string_length(args[0]),
+        'string-ref':     lambda args: string_ref(args[0], args[1]),
+        'string-append':  lambda args: string_append(*args),
+        'substring':      lambda args: substring(args[0], args[1], args[2]),
+        'string->list':   lambda args: string_to_list(args[0]),
+        'list->string':   lambda args: list_to_string(args[0]),
+        'string->number': lambda args: string_to_number(args[0]),
+        'number->string': lambda args: number_to_string(args[0]),
+        'string=?':       lambda args: string_is__q(args[0], args[1]),
+        'string<?':       lambda args: stringLessThan_q(args[0], args[1]),
+        # Symbol / char operations
+        'symbol->string':  lambda args: symbol_to_string(args[0]),
+        'string->symbol':  lambda args: string_to_symbol(args[0]),
+        'char->integer':   lambda args: char_to_integer(args[0]),
+        'integer->char':   lambda args: integer_to_char(args[0]),
+        'char-alphabetic?': lambda args: char_alphabetic_q(args[0]),
+        'char-numeric?':    lambda args: char_numeric_q(args[0]),
+        'char-whitespace?': lambda args: char_whitespace_q(args[0]),
+        # Higher-order (propagate _TrampolineFallback if proc not directly evaluable)
+        'map':      _direct_map,
+        'for-each': _direct_for_each,
+    }
+    for sym_name, direct_fn in name_to_direct.items():
+        b = search_env(toplevel_env, make_symbol(sym_name))
+        if b is not False:
+            proc = binding_value(b)
+            if isinstance(proc, tuple) and proc[0] is symbol_procedure:
+                result[proc[1]] = direct_fn
+    return result
+
+def _apply_direct(proc, args, env):
+    global _fast_prim_map
+    if dlr_proc_q(proc):
+        return dlr_apply(proc, List(*args))
+    if isinstance(proc, tuple) and proc[0] is symbol_procedure:
+        fn = proc[1]
+        if _fast_prim_map is None:
+            _fast_prim_map = _build_fast_prim_map()
+        direct = _fast_prim_map.get(fn)
+        if direct is not None:
+            return direct(args)      # args is a Python list — no cons needed
+        if len(proc) == 6 and fn is b_proc_1_d and proc[5]:
+            bodies, formals, cenv = proc[2], proc[3], proc[4]
+            new_env = extend(cenv, formals, List(*args), make_empty_docstrings(len(args)))
+            return _eval_sequence_direct(bodies, new_env)
+    raise _TrampolineFallback()
+
+def _eval_sequence_direct(bodies, env):
+    cur = bodies
+    while True:
+        exp = cur.car
+        if cur.cdr is symbol_emptylist:
+            return _eval_direct(exp, env)   # tail expression: TCO via _eval_direct loop
+        _eval_direct(exp, env)              # intermediate expr: eval for side effects
+        cur = cur.cdr
+
+### Native b_proc_1_d and closure (direct-eval-aware):
+
+def b_proc_1_d(bodies, formals, env, _safe=False):
+    # _safe is used by apply_proc fast path, ignored here (trampoline path)
+    formals_and_args = process_formals_and_args(formals, args_reg, info_reg, handler_reg, fail_reg)
+    new_formals = (formals_and_args).car
+    new_args = (formals_and_args).cdr
+    if (numeric_equal(length(new_args), length(new_formals)) is not False):
+        GLOBALS['k_reg'] = k2_reg
+        GLOBALS['env_reg'] = extend(env, new_formals, new_args, make_empty_docstrings(length(new_args)))
+        GLOBALS['exps_reg'] = bodies
+        GLOBALS['pc'] = eval_sequence
+    else:
+        GLOBALS['msg_reg'] = "incorrect number of arguments in application"
+        GLOBALS['pc'] = runtime_error
+
+def closure(formals, bodies, env):
+    safe = _is_direct_eval_safe(bodies)
+    return make_proc(b_proc_1_d, bodies, formals, env, safe)
+
+### Native frame functions (dict-cached for O(1) variable lookup):
+
+def make_frame(variables, values, docstrings):
+    # Single pass: build bindings list and search cache simultaneously
+    bindings = []
+    cache = {}
+    vars_cur, vals_cur, docs_cur = variables, values, docstrings
+    while isinstance(vars_cur, cons):
+        b = cons(vals_cur.car, docs_cur.car)  # make_binding inlined
+        bindings.append(b)
+        cache[vars_cur.car] = b
+        vars_cur = vars_cur.cdr
+        vals_cur = vals_cur.cdr
+        docs_cur = docs_cur.cdr
+    bindings_vector = Vector(bindings)
+    frame = List(bindings_vector, variables)
+    frame._search_cache = cache
+    return frame
+
+def add_binding(new_var, new_binding, frame):
+    vars = (frame).cdr.car
+    old_bindings = (frame).car  # Vector
+    new_bindings = Vector(list(old_bindings) + [new_binding])
+    new_frame = List(new_bindings, append(vars, List(new_var)))
+    cache = getattr(frame, '_search_cache', None)
+    if cache is not None:
+        new_cache = dict(cache)
+        new_cache[new_var] = new_binding
+        new_frame._search_cache = new_cache
+    return new_frame
+
+def continuation_object_q(x):
+    return (isinstance(x, tuple) and len(x) > 0 and
+            x[0] in (symbol_continuation, symbol_continuation2,
+                     symbol_continuation3, symbol_continuation4))
+
+_empty_docstrings_cache = {}
+def make_empty_docstrings(n):
+    if n not in _empty_docstrings_cache:
+        result = symbol_emptylist
+        for _ in range(n):
+            result = cons("", result)
+        _empty_docstrings_cache[n] = result
+    return _empty_docstrings_cache[n]
+
+def process_args(args, params, info, handler, fail):
+    return args
+
+def process_formals(params, info, handler, fail):
+    # Fast path: if all params are plain Symbols, return unchanged (avoids Map allocation)
+    cur = params
+    while isinstance(cur, cons):
+        if not isinstance(cur.car, Symbol):
+            return Map(get_symbol, params)
+        cur = cur.cdr
+    return params
+
+def process_formals_and_args(params, args, info, handler, fail):
+    return cons(process_formals(params, info, handler, fail), args)
 
 ### Native other functions:
 
@@ -631,7 +1263,7 @@ def list_q(item):
     return current is symbol_emptylist
 
 def procedure_q(item):
-    return pair_q(item) and (item.car is symbol_procedure)
+    return isinstance(item, tuple) and len(item) > 0 and item[0] is symbol_procedure
 
 def symbol_q(item):
     return ((isinstance(item, Symbol) or association_q(item))
@@ -1026,6 +1658,9 @@ def make_safe(item):
 
 def search_frame(frame, variable):
     if isinstance(frame, cons):
+        cache = getattr(frame, '_search_cache', None)
+        if cache is not None:
+            return cache.get(variable, False)
         bindings = frame.car
         variables = frame.cdr.car
         i = 0
