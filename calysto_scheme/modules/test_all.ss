@@ -868,9 +868,13 @@
 	  (unparse (parse '(+ 1 2)))
 	  '(+ 1 2)
 	  "unparse")
+  ;; Default changed to #f: *use-stack-trace* wraps every non-JIT/
+  ;; non-Phase-2 call's continuation in an extra pop-frame -- ~10-13%
+  ;; wall-clock and ~25-45% memory reduction on the trampoline path with
+  ;; it off (see interpreter-cps.ss and README-PERFORMANCE.md).
   (assert eq?
 	  (use-stack-trace)
-	  #t
+	  #f
 	  "use-stack-trace")
   (assert eq?
 	  (use-tracing)
@@ -1308,5 +1312,383 @@
    (rator lc-exp?)
    (rand lc-exp?)))
 
+(define-tests jit-edge-cases
+  ;; Phase 4: tail-call flattening -- guards against RecursionError past
+  ;; ~4,900-5,000 iterations (fixed by flattening self-recursive tail calls
+  ;; in the JIT and Phase 2 direct-eval interpreter)
+  (define (jit-count-loop n acc) (if (= n 0) acc (jit-count-loop (- n 1) (+ acc 1))))
+  (assert equal?
+	  200000
+	  (jit-count-loop 200000 0)
+	  "case 53")
+
+  ;; Phase 4: mutual tail recursion (each side's JIT compilation depends on
+  ;; the other, so both safely fall back to the flattened Phase 2 path)
+  (define (jit-even? n) (if (= n 0) #t (jit-odd? (- n 1))))
+  (define (jit-odd? n) (if (= n 0) #f (jit-even? (- n 1))))
+  (assert equal?
+	  #t
+	  (jit-even? 50000)
+	  "case 54")
+
+  ;; Phase 5: closures over a function's own parameter, called repeatedly
+  ;; so make-adder gets a chance to JIT-compile -- and each closure keeps
+  ;; independent captured state
+  (define (jit-make-adder k) (lambda (x) (+ x k)))
+  (define (jit-adder-driver n acc)
+    (if (= n 0) acc (jit-adder-driver (- n 1) (+ acc ((jit-make-adder n) 0)))))
+  (assert equal?
+	  5050
+	  (jit-adder-driver 100 0)
+	  "case 55")
+  (define jit-add5 (jit-make-adder 5))
+  (define jit-add10 (jit-make-adder 10))
+  (assert equal?
+	  (list 15 20 6)
+	  (list (jit-add5 10) (jit-add10 10) (jit-add5 1))
+	  "case 56")
+
+  ;; Phase 5: nested closures -- the innermost lambda captures a variable
+  ;; two lexical levels out, not just its immediately enclosing frame
+  (define (jit-make-adder2 a) (lambda (b) (lambda (c) (+ a b c))))
+  (define (jit-adder2-driver n acc)
+    (if (= n 0) acc (jit-adder2-driver (- n 1) (+ acc (((jit-make-adder2 n) 2) 3)))))
+  (assert equal?
+	  5550
+	  (jit-adder2-driver 100 0)
+	  "case 57")
+
+  ;; Phase 5: immediately-invoked lambda under JIT, e.g. ((lambda (x) ...) e)
+  ;; -- regression test for the "'tuple' object is not callable" bug caused
+  ;; by let/or/and desugaring to this shape
+  (define (jit-iife k) ((lambda (x) (+ x k)) 100))
+  (define (jit-run-iife n acc) (if (= n 0) acc (jit-run-iife (- n 1) (+ acc (jit-iife n)))))
+  (assert equal?
+	  15050
+	  (jit-run-iife 100 0)
+	  "case 58")
+
+  ;; Phase 6: a parameter used in operator position, called with a closure
+  (define (jit-apply-twice f x) (f (f x)))
+  (define (jit-apply-twice-driver n acc)
+    (if (= n 0) acc (jit-apply-twice-driver (- n 1) (+ acc (jit-apply-twice (jit-make-adder 3) n)))))
+  (assert equal?
+	  5650
+	  (jit-apply-twice-driver 100 0)
+	  "case 59")
+
+  ;; Phase 6: a parameter used in operator position, called with a
+  ;; first-class primitive
+  (define (jit-call-with f a b) (f a b))
+  (define (jit-run-prim n acc) (if (= n 0) acc (jit-run-prim (- n 1) (+ acc (if (jit-call-with < n 999999) 1 0)))))
+  (assert equal?
+	  100
+	  (jit-run-prim 100 0)
+	  "case 60")
+
+  ;; Phase 6: a parameter used in operator position, called with a captured
+  ;; continuation from call/cc
+  (define (jit-call-it f x) (f x))
+  (assert equal?
+	  43
+	  (+ 1 (call/cc (lambda (k) (jit-call-it k 42) 999)))
+	  "case 61")
+
+  ;; Correctness regression: a Phase-2/JIT-eligible closure whose body does
+  ;; real work and *then* calls something outside the fast-path allow-list
+  ;; (here, a nested closure that uses set!, which is not JIT/Phase-2
+  ;; eligible) must not silently re-execute that work. apply_proc's
+  ;; fallback catches _TrampolineFallback around the *whole* closure body
+  ;; and re-runs it entirely via the slow trampoline on any mid-body
+  ;; failure -- including work that already ran and had real (observable)
+  ;; side effects. jit-dbl-fib-1 counts its own calls via a vector (not
+  ;; set!, so it stays Phase-2/JIT-eligible itself); naive recursion to
+  ;; n=10 makes exactly 177 calls. Before this was fixed, the trailing
+  ;; call to jit-dbl-trigger (unrelated to the count, added only to
+  ;; provoke the fallback) caused the entire body -- including the fib
+  ;; computation that had already finished -- to run a second time via the
+  ;; slow trampoline, doubling the counter to 354.
+  (define jit-dbl-counter-1 (vector 0))
+  (define (jit-dbl-trigger) (let ((x 0)) (set! x (+ x 1)) x))
+  (define (jit-dbl-fib-1 n)
+    (vector-set! jit-dbl-counter-1 0 (+ (vector-ref jit-dbl-counter-1 0) 1))
+    (if (< n 2) 1 (+ (jit-dbl-fib-1 (- n 1)) (jit-dbl-fib-1 (- n 2)))))
+  (let ((jit-dbl-start 0))
+    (jit-dbl-fib-1 10)
+    (jit-dbl-trigger))
+  (assert equal?
+	  177
+	  (vector-ref jit-dbl-counter-1 0)
+	  "case 62")
+
+  ;; Correctness regression, one level of nesting deeper: an OUTER closure
+  ;; does its own work, then calls a HELPER closure whose own body does
+  ;; work and then triggers the same fallback. Before the fix this could
+  ;; even compound rather than just double (observed 2x on the outer
+  ;; closure's own counter and 3x on the inner one in manual testing),
+  ;; since a mid-body failure inside a non-tail nested call unwinds past
+  ;; *multiple* logical closures to the one shared fallback point at the
+  ;; outermost apply_proc -- not just the closure whose body actually
+  ;; failed.
+  (define jit-dbl-counter-o (vector 0))
+  (define jit-dbl-counter-h (vector 0))
+  (define (jit-dbl-h n)
+    (vector-set! jit-dbl-counter-h 0 (+ (vector-ref jit-dbl-counter-h 0) 1))
+    (jit-dbl-trigger)
+    n)
+  (define (jit-dbl-o n)
+    (vector-set! jit-dbl-counter-o 0 (+ (vector-ref jit-dbl-counter-o 0) 1))
+    (+ n (jit-dbl-h n)))
+  (jit-dbl-o 5)
+  (assert equal?
+	  (list 1 1)
+	  (list (vector-ref jit-dbl-counter-o 0) (vector-ref jit-dbl-counter-h 0))
+	  "case 63")
+
+  ;; Correctness regression, a specific gap found (and fixed) during
+  ;; development of _is_phase2_safe itself: a closure that does work and
+  ;; then *returns* a dotted-formals lambda (lambda (a . rest) ...) as a
+  ;; plain value -- NOT calling it, just creating it. _eval_direct has no
+  ;; case for mu-lambda-aexp at all (only plain lambda-aexp), so
+  ;; evaluating this always falls to its `else: raise
+  ;; _TrampolineFallback()`. The existing mu-lambda test group above only
+  ;; exercises dotted-formals lambdas in IMMEDIATELY-CALLED (IIFE)
+  ;; position, e.g. ((lambda (a . z) ...) args...) -- which is already
+  ;; excluded from Phase 2 for an unrelated reason (a computed/nested
+  ;; operator can't be statically proven safe), so it never exercised
+  ;; this specific "returned as a value" shape. _is_phase2_safe initially
+  ;; (wrongly) treated mu-lambda-aexp as safe by copying
+  ;; _is_direct_eval_safe's lambda-boundary pattern without checking it
+  ;; against _eval_direct's actual cases -- certifying a closure Phase 2
+  ;; could not actually evaluate, which crashed instead of silently
+  ;; double-executing (apply_proc no longer catches a fallback from a
+  ;; certified-safe closure -- see README-PERFORMANCE.md's "Phase 8") but
+  ;; still broke previously-working code. Confirms both that the counter
+  ;; isn't doubled AND that the call doesn't crash.
+  (define jit-dbl-counter-mu (vector 0))
+  (define (jit-dbl-make-variadic n)
+    (vector-set! jit-dbl-counter-mu 0 (+ (vector-ref jit-dbl-counter-mu 0) 1))
+    (lambda (a . rest) (+ n a (length rest))))
+  (define jit-dbl-variadic-fn (jit-dbl-make-variadic 100))
+  (assert equal?
+	  (list 1 103)
+	  (list (vector-ref jit-dbl-counter-mu 0) (jit-dbl-variadic-fn 1 2 3))
+	  "case 64")
+
+  ;; Correctness regression: a pre-existing instance of the same bug
+  ;; class, unrelated to mu-lambda, found while auditing which AST node
+  ;; types _is_direct_eval_safe's set!-only check (the OLD, still-used
+  ;; gate for whether a closure is JIT/Phase-2-*eligible* at all) fails
+  ;; to exclude. _eval_direct has no case for try-catch-aexp either, so a
+  ;; closure using (try ... (catch ...)) after doing other work was
+  ;; already double-executing that work on the original, unmodified
+  ;; interpreter (confirmed directly against the pre-Phase-8 commit) --
+  ;; _is_phase2_safe's default-deny design (only 7 explicitly-recognized
+  ;; node types are ever treated as safe; everything else, including
+  ;; try/catch, raise, and choose, falls through to "unsafe") closes this
+  ;; as a side effect, without having been specifically designed for it.
+  (define jit-dbl-counter-try (vector 0))
+  (define (jit-dbl-work-then-try n)
+    (vector-set! jit-dbl-counter-try 0 (+ (vector-ref jit-dbl-counter-try 0) 1))
+    (try (/ 1 0) (catch e "caught")))
+  (jit-dbl-work-then-try 5)
+  (assert equal?
+	  1
+	  (vector-ref jit-dbl-counter-try 0)
+	  "case 65")
+
+  ;; call/cc is a primitive, not a special AST node, so a call to it from
+  ;; inside a JIT/Phase-2-eligible closure is just an ordinary application
+  ;; of an unrecognized primitive -- _apply_direct has no entry for it in
+  ;; _FAST_PRIM_SPECS and it isn't a Phase-2-safe closure either, so it
+  ;; raises _TrampolineFallback and the whole call re-runs on the
+  ;; always-correct trampoline, which knows how to honor call/cc's real
+  ;; continuation-capture semantics. jit-cc-loop is otherwise identical in
+  ;; shape to jit-count-loop (case 53): plain tail self-recursion that the
+  ;; JIT flattens into a Python while-loop. escape is called from deep
+  ;; inside that flattened loop (at n=7000, out of 200000 iterations) --
+  ;; this checks that unwinding out of a JIT'd/flattened loop via a
+  ;; captured continuation lands on the right value and doesn't corrupt
+  ;; the compiled function for later calls.
+  (define (jit-cc-loop n escape)
+    (if (= n 0)
+	'looped-to-zero
+	(begin
+	  (if (= n 7000) (escape 'escaped-early) #f)
+	  (jit-cc-loop (- n 1) escape))))
+  (assert equal?
+	  'escaped-early
+	  (call/cc (lambda (k) (jit-cc-loop 200000 k)))
+	  "case 66")
+  ;; same compiled jit-cc-loop, called again right after the escape above,
+  ;; this time with a plain non-escaping continuation -- confirms the
+  ;; earlier non-local exit didn't leave the JIT cache or the flattened
+  ;; loop's Python frame in a bad state.
+  (assert equal?
+	  'looped-to-zero
+	  (call/cc (lambda (k) (jit-cc-loop 200000 (lambda (x) x))))
+	  "case 67")
+
+  ;; call/cc early-exit from NON-tail, doubly-recursive JIT-compiled
+  ;; search (fib-shaped, like Phase 7's motivating case, not a flattened
+  ;; tail loop). jit-cc-tree-counter tracks how many calls actually ran;
+  ;; this is the call/cc analogue of case 62/63's try-catch double-
+  ;; execution regression -- confirms that escaping via a captured
+  ;; continuation out of the middle of a JIT'd non-tail recursion, after
+  ;; real side-effecting work already happened, does not replay that work
+  ;; a second time when the trampoline fallback kicks in for the call/cc
+  ;; call itself. Descending 10 -> 9 -> 8 -> 7 along the first recursive
+  ;; branch before matching target=7 and escaping, exactly 4 calls should
+  ;; have run (the second branch at each level, and everything below 7,
+  ;; must never execute).
+  (define jit-cc-tree-counter (vector 0))
+  (define (jit-cc-tree-search n target found)
+    (vector-set! jit-cc-tree-counter 0 (+ (vector-ref jit-cc-tree-counter 0) 1))
+    (if (= n target)
+	(found n)
+	(if (= n 0)
+	    'not-found
+	    (begin
+	      (jit-cc-tree-search (- n 1) target found)
+	      (jit-cc-tree-search (- n 1) target found)))))
+  (assert equal?
+	  (list 7 4)
+	  (list (call/cc (lambda (k) (jit-cc-tree-search 10 7 k)))
+		(vector-ref jit-cc-tree-counter 0))
+	  "case 68")
+
+  ;; choose/require backtracking search repeatedly calling a pure,
+  ;; Phase-2/JIT-eligible helper (jit-choose-square has no set!, so it's
+  ;; fast-path-eligible on its own) across every branch the search visits
+  ;; -- including branches that later fail `require` and get backed out
+  ;; of. choose/require themselves are never JIT/Phase-2-eligible (choose
+  ;; isn't one of _is_phase2_safe's recognized node types, so it always
+  ;; runs on the trampoline), but the helper they call on each branch is
+  ;; -- this checks that a JIT-compiled helper keeps returning correct,
+  ;; non-duplicated-looking results when invoked over and over by
+  ;; backtracking control flow it has no awareness of. The exact call
+  ;; count (28) pins down the search order so a future change to choose's
+  ;; backtracking order would be caught here too.
+  (define jit-choose-counter (vector 0))
+  (define (jit-choose-square x)
+    (vector-set! jit-choose-counter 0 (+ (vector-ref jit-choose-counter 0) 1))
+    (* x x))
+  (define (jit-choose-pair-search)
+    (let ((a (choose 1 2 3 4 5)))
+      (let ((b (choose 1 2 3 4 5)))
+	(require (= (+ (jit-choose-square a) (jit-choose-square b)) 25))
+	(require (< a b))
+	(list a b))))
+  (assert equal?
+	  (list '(3 4) 28)
+	  (list (jit-choose-pair-search) (vector-ref jit-choose-counter 0))
+	  "case 69")
+
+  ;; choose/require backtracking search where the per-branch helper is
+  ;; itself a JIT-compiled SELF-RECURSIVE function (naive fib, the JIT's
+  ;; own canonical example -- see README-PERFORMANCE.md), not just a
+  ;; single-call primitive-shaped helper like case 69. This exercises
+  ;; repeated invocation of one compiled instance across many backtracked
+  ;; (tried-then-abandoned) branches: a=1..5 all fail the first require
+  ;; before a=6 succeeds, then b=1..4 fail the second require before b=5
+  ;; succeeds.
+  (define (jit-choose-fib n) (if (< n 2) n (+ (jit-choose-fib (- n 1)) (jit-choose-fib (- n 2)))))
+  (define (jit-choose-fib-search)
+    (let ((a (choose 1 2 3 4 5 6 7 8)))
+      (require (> (jit-choose-fib a) 5))
+      (let ((b (choose 1 2 3 4 5 6 7 8)))
+	(require (= (+ (jit-choose-fib a) (jit-choose-fib b)) 13))
+	(list a b))))
+  (assert equal?
+	  '(6 5)
+	  (jit-choose-fib-search)
+	  "case 70")
+
+  ;; Multi-shot re-entrant continuations (a real generator/coroutine built
+  ;; on call/cc, not just a one-shot escape like cases 66-68) driving a
+  ;; JIT-eligible helper across several separate resumptions. Naively,
+  ;; resuming a saved continuation from a *different* top-level form than
+  ;; the one that captured it breaks in this interpreter: execute-loop-rm
+  ;; (see interpreter-cps.ss) drives the whole file through ONE shared
+  ;; global register/pc trampoline, calling (trampoline) once per
+  ;; top-level form and looping at the Python/register-machine level, not
+  ;; via Scheme continuations. A captured continuation's chain still
+  ;; bottoms out at REP-k (the single shared toplevel continuation), so
+  ;; invoking it from a later form's trampoline() call doesn't return a
+  ;; value to that form -- it hijacks that form's still-running
+  ;; trampoline() instance to run the OLD continuation's leftover work
+  ;; instead, silently discarding whatever the later form was doing. This
+  ;; is by design (REP-k is deliberately shared/global), not a bug -- but
+  ;; it means user code that wants an isolated, "resettable" call needs a
+  ;; fresh continuation boundary of its own.
+  ;;
+  ;; `callback` (special form, not a regular primitive -- see
+  ;; callback-aexp in parser-cps.ss/interpreter-cps.ss) provides exactly
+  ;; that: (callback thunk) wraps thunk in a native Python closure that,
+  ;; when called, sets handler_reg/k2_reg to fresh REP_handler/REP_k and
+  ;; runs a NESTED (trampoline) call to completion (see dlr_func/callback
+  ;; in Scheme.py) -- the same mechanism used to hand Scheme procedures to
+  ;; host callbacks (e.g. `sort`'s comparator). Because that nested
+  ;; trampoline has its OWN fresh REP_k, a continuation captured inside it
+  ;; bottoms out there instead of at the outer shared REP_k, so invoking
+  ;; it later doesn't reach past the (callback ...) boundary -- resetting
+  ;; the continuation stack for that call. Wrapping both the generator's
+  ;; first call and every resume in (callback ...) makes a real multi-shot
+  ;; generator work correctly from ordinary sequential code.
+  ;;
+  ;; jit-gen2-double is a trivial pure helper (JIT/Phase-2-eligible on its
+  ;; own); jit-gen2 itself never is (uses define/set!, like all
+  ;; call/cc-based generators), so it always runs on the trampoline -- but
+  ;; every value it yields comes from the JIT-compiled helper.
+  (define jit-gen2-saved-k #f)
+  (define (jit-gen2-double x) (* x 2))
+  (define (jit-gen2)
+    (call/cc (lambda (return)
+      (define (yield v)
+	(call/cc (lambda (k)
+	  (set! jit-gen2-saved-k k)
+	  (return v))))
+      (let loop ((i 1))
+	(yield (jit-gen2-double i))
+	(loop (+ i 1))))))
+  (define jit-gen2-run (callback (lambda () (jit-gen2))))
+  (define jit-gen2-resume (callback (lambda () (jit-gen2-saved-k 'go))))
+  (assert equal?
+	  '(2 4 6 8)
+	  (list (jit-gen2-run) (jit-gen2-resume) (jit-gen2-resume) (jit-gen2-resume))
+	  "case 71")
+
+  ;; Same (callback ...)-reset multi-shot generator pattern, but yielding
+  ;; values from a JIT-compiled SELF-RECURSIVE helper (naive fib, like
+  ;; case 70) instead of a single-expression primitive-shaped one --
+  ;; confirms the compiled instance keeps producing correct results
+  ;; across several independent nested-trampoline re-entries, each
+  ;; resuming mid-loop from a completely separate top-level form. The
+  ;; final direct call to jit-gen3-fib afterward confirms driving it
+  ;; through the generator/callback machinery didn't leave its JIT-cached
+  ;; compiled function in a bad state.
+  (define (jit-gen3-fib n) (if (< n 2) n (+ (jit-gen3-fib (- n 1)) (jit-gen3-fib (- n 2)))))
+  (define jit-gen3-saved-k #f)
+  (define (jit-gen3)
+    (call/cc (lambda (return)
+      (define (yield v)
+	(call/cc (lambda (k)
+	  (set! jit-gen3-saved-k k)
+	  (return v))))
+      (let loop ((i 0))
+	(yield (jit-gen3-fib i))
+	(loop (+ i 1))))))
+  (define jit-gen3-run (callback (lambda () (jit-gen3))))
+  (define jit-gen3-resume (callback (lambda () (jit-gen3-saved-k 'go))))
+  (assert equal?
+	  '(0 1 1 2 3 5)
+	  (list (jit-gen3-run) (jit-gen3-resume) (jit-gen3-resume) (jit-gen3-resume)
+		(jit-gen3-resume) (jit-gen3-resume))
+	  "case 72")
+  (assert equal?
+	  610
+	  (jit-gen3-fib 15)
+	  "case 73")
+  )
 
 (run-tests)

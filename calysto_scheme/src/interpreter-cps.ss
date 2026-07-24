@@ -369,7 +369,14 @@
 
 (define *stack-trace* '(()))
 
-(define *use-stack-trace* #t)
+;; Default off: *use-stack-trace* wraps every non-JIT/non-Phase-2 call's
+;; continuation in an extra pop-frame, adding a heap-allocated
+;; continuation and an extra trampoline step per call. Measured ~10-13%
+;; wall-clock and ~25-45% memory reduction on the trampoline path with it
+;; off (see calysto_scheme/src/README-PERFORMANCE.md). Users who want
+;; stack traces for debugging can still turn it back on with
+;; (use-stack-trace #t).
+(define *use-stack-trace* #f)
 
 (define get-use-stack-trace
   (lambda ()
@@ -378,6 +385,24 @@
 (define set-use-stack-trace!
   (lambda (value)
     (set! *use-stack-trace* (true? value))))
+
+;; Default on: *use-jit* gates entry into Phase 2/JIT (apply_proc,
+;; _apply_direct, _jit_call in Scheme.py) -- a closure containing set!
+;; is excluded from Phase 2/JIT regardless of this flag (see
+;; calysto_scheme/src/README-PERFORMANCE.md's "Abandoned: set! support
+;; in Phase 2/JIT" section); this flag instead lets everything else
+;; (naive/tail recursion, closures, HOF, map, ...) be forced onto the
+;; same always-correct trampoline path too, e.g. for debugging or
+;; profiling the slow path. Turn it back off with (use-jit #f).
+(define *use-jit* #t)
+
+(define get-use-jit
+  (lambda ()
+    *use-jit*))
+
+(define set-use-jit!
+  (lambda (value)
+    (set! *use-jit* (true? value))))
 
 (define initialize-stack-trace!
   (lambda ()
@@ -658,7 +683,49 @@
 	     (string=? exception-type "ScanError")
 	     (string=? exception-type "UnhandledException")))))
 
+(define* report-unit-test-diagnostic-fallback
+  ;; Top-level (not a local closure): this specialized register-machine
+  ;; compiler only lifts lambdas passed through the CPS m/k/handler
+  ;; plumbing into their own functions -- a local, directly-called
+  ;; zero-arg helper closure (which is what this originally was) isn't
+  ;; that pattern and isn't compiled correctly. See run-unit-test-cases
+  ;; below for why this exists.
+  (lambda (msg where test-name assertions verbose right wrong env handler fail k)
+    (if (> (string-length msg) 0)
+        (if (eq? where 'none)
+            (printf "  Error: ~a \"~a\"\n" test-name msg)
+            (printf "  Error: ~a \"~a\" at ~a\n" test-name msg where))
+        (if (eq? where 'none)
+            (printf "  Error: ~a\n" test-name)
+            (printf "  Error: ~a at ~a\n" test-name where)))
+    (make-test-callback test-name msg #f "" "" "" "")
+    (run-unit-test-cases test-name (cdr assertions) verbose right (+ wrong 1) env handler fail k)))
+
 (define* run-unit-test-cases
+  ;; test-case-handler fires whenever evaluating (car assertions) raises
+  ;; an exception. It used to assume (car assertions) was always
+  ;; assert-shaped -- (app-exp assert op e1 e2 name) -- to build a
+  ;; diagnostic report. But define-tests bodies freely mix plain
+  ;; `define`s alongside `assert` calls (every top-level form here runs
+  ;; with this handler installed, not just asserts), and if a `define`
+  ;; raises instead, that assumption is wrong: destructuring a
+  ;; non-assert-shaped expression as if it were one can itself throw.
+  ;; Because nothing updates the active handler register until *after*
+  ;; that destructuring succeeds, a failure there causes trampoline's
+  ;; top-level catch-all to re-invoke this exact same handler with the
+  ;; exact same (still-failing) arguments -- an unconditional infinite
+  ;; loop, confirmed independent of any JIT/Phase-2 behavior: a plain
+  ;; (/ 1 0) inside a `define` in a define-tests block reproduces it on
+  ;; its own, on unmodified interpreter-cps.ss. assert-shaped? checks the
+  ;; structure before attempting the assert-specific destructuring
+  ;; instead of relying on catching a failure from it -- this compiler's
+  ;; ds-transform pass doesn't support Scheme's `guard`/exception forms
+  ;; here (this file is the interpreter's own implementation language,
+  ;; not code run *by* the interpreter, where try/catch would apply).
+  ;; The two re-evaluation calls below get their own minimal handler
+  ;; instead of reusing the outer `handler` -- the "FIXME: could have an
+  ;; error" cases already flagged below -- so a failure there is reported
+  ;; once and the suite moves on too, instead of looping.
   (lambda (test-name assertions verbose right wrong env handler fail k)
     (if (null? assertions)
         (k (list right wrong) fail)
@@ -666,33 +733,46 @@
                (lambda-handler2 (e fail)
 		 (let* ((msg (get-exception-message e))
 			(where (get-exception-info e))
-			(assert-exp (car assertions)) ;; (app-exp assert op e1 e2 name)
-			(proc-exp (aunparse (car (cdr^ assert-exp))))
-			(test-aexp (cadr (cdr^ assert-exp)))
-			(test-exp (aunparse test-aexp))
-			(result-exp (caddr (cdr^ assert-exp)))
-			(traceback (get-traceback-string (list 'exception e))))
-		   (if (> (string-length msg) 0)
-		       (if (eq? where 'none)
-			   (printf "  Error: ~a \"~a\"\n" test-name msg)
-			   (printf "  Error: ~a \"~a\" at ~a\n" test-name msg where))
-		       (if (eq? where 'none)
-			   (printf "  Error: ~a\n" test-name)
-			   (printf "  Error: ~a at ~a\n" test-name where)))
-		   (initialize-stack-trace!)
-		   (m result-exp env handler fail ;; FIXME: could have an error in result?
-		      (lambda-cont2 (result-val fail)
-			(m test-aexp env handler fail ;; FIXME: could have an error in test
-			   (lambda-cont2 (test-val fail)
-			      (if verbose
-				  (begin
-				    (printf "~a\n" traceback)
-				    (printf "  Procedure    : ~a\n" proc-exp)
-				    (printf "       src     : ~a\n" test-exp)
-				    (printf "       src eval: ~a\n" test-val)
-				    (printf "       result  : ~a\n" result-val)))
-			      (make-test-callback test-name msg #f traceback proc-exp test-exp result-val)
-			      (run-unit-test-cases test-name (cdr assertions) verbose right (+ wrong 1) env handler fail k)))))))))
+			(assert-exp (car assertions))
+			(assert-shaped?
+			 (and (pair? assert-exp)
+			      (pair? (cdr^ assert-exp))
+			      (pair? (cdr (cdr^ assert-exp)))
+			      (pair? (cddr (cdr^ assert-exp))))))
+		   (if (not assert-shaped?)
+		       (report-unit-test-diagnostic-fallback msg where test-name assertions verbose right wrong env handler fail k)
+		       (let* ((proc-exp (aunparse (car (cdr^ assert-exp))))
+			      (test-aexp (cadr (cdr^ assert-exp)))
+			      (test-exp (aunparse test-aexp))
+			      (result-exp (caddr (cdr^ assert-exp)))
+			      (traceback (get-traceback-string (list 'exception e))))
+			 (if (> (string-length msg) 0)
+			     (if (eq? where 'none)
+				 (printf "  Error: ~a \"~a\"\n" test-name msg)
+				 (printf "  Error: ~a \"~a\" at ~a\n" test-name msg where))
+			     (if (eq? where 'none)
+				 (printf "  Error: ~a\n" test-name)
+				 (printf "  Error: ~a at ~a\n" test-name where)))
+			 (initialize-stack-trace!)
+			 (m result-exp env
+			    (lambda-handler2 (e2 fail2)
+			      (report-unit-test-diagnostic-fallback msg where test-name assertions verbose right wrong env handler fail2 k))
+			    fail
+			    (lambda-cont2 (result-val fail)
+			      (m test-aexp env
+				 (lambda-handler2 (e3 fail3)
+				   (report-unit-test-diagnostic-fallback msg where test-name assertions verbose right wrong env handler fail3 k))
+				 fail
+				 (lambda-cont2 (test-val fail)
+				    (if verbose
+					(begin
+					  (printf "~a\n" traceback)
+					  (printf "  Procedure    : ~a\n" proc-exp)
+					  (printf "       src     : ~a\n" test-exp)
+					  (printf "       src eval: ~a\n" test-val)
+					  (printf "       result  : ~a\n" result-val)))
+				    (make-test-callback test-name msg #f traceback proc-exp test-exp result-val)
+				    (run-unit-test-cases test-name (cdr assertions) verbose right (+ wrong 1) env handler fail k)))))))))))
 	  (initialize-stack-trace!)
           (m (car assertions) env test-case-handler fail
 	     (lambda-cont2 (v fail)
@@ -938,12 +1018,31 @@
   (lambda (ls)
     (and (not (null? ls)) (not (null? (cdr ls))) (null? (cddr ls)))))
 
+(define length-three?
+  (lambda (ls)
+    (and (not (null? ls)) (not (null? (cdr ls)))
+         (not (null? (cddr ls))) (null? (cdddr ls)))))
+
 (define length-at-least?
   (lambda (n ls)
     (cond
       ((< n 1) #t)
       ((or (null? ls) (not (pair? ls))) #f)
       (else (length-at-least? (- n 1) (cdr ls))))))
+
+;; zero?, expt, memv, and assv used to accept (and silently discard) extra
+;; arguments because length-at-least? only checks a lower bound -- see
+;; tests/test_arity_tightening.py. length-exactly?/length-between? give an
+;; exact/ranged check for primitives (zero?, expt, memv, assv,
+;; number->string) whose implementation only ever reads a fixed number of
+;; args.
+(define length-exactly?
+  (lambda (n ls)
+    (and (length-at-least? n ls) (not (length-at-least? (+ n 1) ls)))))
+
+(define length-between?
+  (lambda (lo hi ls)
+    (and (length-at-least? lo ls) (not (length-at-least? (+ hi 1) ls)))))
 
 (define all-numeric?
   (lambda (ls)
@@ -975,7 +1074,10 @@
 ;; zero?
 (define zero?-prim
   (lambda-proc (args env2 info handler fail k2)
-      (k2 (= (car args) 0) fail)))
+    (cond
+      ((not (length-exactly? 1 args))
+       (runtime-error "incorrect number of arguments to zero?" info handler fail))
+      (else (k2 (= (car args) 0) fail)))))
 
 ;; python-eval
 (define python-eval-prim
@@ -995,7 +1097,10 @@
 ;; expt
 (define expt-prim
   (lambda-proc (args env2 info handler fail k2)
-    (k2 (expt-native (car args) (cadr args)) fail)))
+    (cond
+      ((not (length-exactly? 2 args))
+       (runtime-error "incorrect number of arguments to expt" info handler fail))
+      (else (k2 (expt-native (car args) (cadr args)) fail)))))
 
 (define end-of-session?
   (lambda (x) (eq? x end-of-session)))
@@ -1182,25 +1287,42 @@
   ;; (substring "string" start)
   ;; (substring "string" start stop)
   (lambda-proc (args env2 info handler fail k2)
-     (if (= (length args) 3)
-	 (k2 (substring (car args) (cadr args) (caddr args)) fail)
-	 (k2 (substring (car args) (cadr args) (string-length (car args))) fail))))
+     (cond
+       ((length-three? args)
+        (k2 (substring (car args) (cadr args) (caddr args)) fail))
+       ((length-two? args)
+        (k2 (substring (car args) (cadr args) (string-length (car args))) fail))
+       (else
+        (runtime-error "incorrect number of arguments to substring" info handler fail)))))
 
 ;; number->string
 (define number->string-prim
-  ;; given a number, returns those digits as a string
+  ;; given a number, returns those digits as a string; an optional second
+  ;; arg is a radix (2/8/10/16 -- see number_to_string in Scheme.py, which
+  ;; this calls into with 1 or 2 args)
   (lambda-proc (args env2 info handler fail k2)
-     (k2 (number->string (car args)) fail)))
+    (cond
+      ((not (length-between? 1 2 args))
+       (runtime-error "incorrect number of arguments to number->string" info handler fail))
+      ((length-at-least? 2 args)
+       (k2 (number->string (car args) (cadr args)) fail))
+      (else (k2 (number->string (car args)) fail)))))
 
 ;; assv
 (define assv-prim
   ;; given 'a '((b 1) (a 2)) returns (a 2)
   (lambda-proc (args env2 info handler fail k2)
-     (k2 (assv (car args) (cadr args)) fail)))
+    (cond
+      ((not (length-exactly? 2 args))
+       (runtime-error "incorrect number of arguments to assv" info handler fail))
+      (else (k2 (assv (car args) (cadr args)) fail)))))
 ;; memv
 (define memv-prim
   (lambda-proc (args env2 info handler fail k2)
-     (k2 (memv (car args) (cadr args)) fail)))
+    (cond
+      ((not (length-exactly? 2 args))
+       (runtime-error "incorrect number of arguments to memv" info handler fail))
+      (else (k2 (memv (car args) (cadr args)) fail)))))
 
 (define safe-print
   (lambda (arg)
@@ -1342,9 +1464,7 @@
   (lambda-proc (args env2 info handler fail k2)
     (cond
       ((not (length-one? args))
-       (runtime-error
-         (format "incorrect number of arguments to symbol?: you gave ~s, should have been 1 argument" args)
-         info handler fail))
+       (runtime-error "incorrect number of arguments to symbol?" info handler fail))
       (else (k2 (apply symbol? args) fail)))))
 
 ;; number?
@@ -1826,7 +1946,7 @@
   (lambda-proc (args env2 info handler fail k2)
     (cond
       ((not (length-two? args))
-       (runtime-error "incorrect number of arguments to %" info handler fail))
+       (runtime-error "incorrect number of arguments to modulo" info handler fail))
       ((= (cadr args) 0)
        (runtime-error "modulo by zero" info handler fail))
       (else (k2 (apply modulo args) fail)))))
@@ -1835,12 +1955,17 @@
 (define min-prim
   (lambda-proc (args env2 info handler fail k2)
     (cond
+      ((not (length-at-least? 1 args))
+       (runtime-error "incorrect number of arguments to min" info handler fail))
       (else (k2 (apply min args) fail)))))
 
 ;; max
 (define max-prim
   (lambda-proc (args env2 info handler fail k2)
-     (k2 (apply max args) fail)))
+    (cond
+      ((not (length-at-least? 1 args))
+       (runtime-error "incorrect number of arguments to max" info handler fail))
+      (else (k2 (apply max args) fail)))))
 
 ;; <
 (define lt-prim
@@ -2476,18 +2601,28 @@
 ;; vector-set!
 (define vector-set!-prim
   (lambda-proc (args env2 info handler fail k2)
-    (vector-set! (car args) (cadr args) (caddr args))
-    (k2 void-value fail)))
+    (cond
+      ((not (length-three? args))
+       (runtime-error "incorrect number of arguments to vector-set!" info handler fail))
+      (else
+       (vector-set! (car args) (cadr args) (caddr args))
+       (k2 void-value fail)))))
 
 ;; vector-ref
 (define vector-ref-prim
   (lambda-proc (args env2 info handler fail k2)
-    (k2 (apply vector-ref args) fail)))
+    (cond
+      ((not (length-two? args))
+       (runtime-error "incorrect number of arguments to vector-ref" info handler fail))
+      (else (k2 (apply vector-ref args) fail)))))
 
 ;; make-vector
 (define make-vector-prim
   (lambda-proc (args env2 info handler fail k2)
-    (k2 (apply make-vector args) fail)))
+    (cond
+      ((not (length-one? args))
+       (runtime-error "incorrect number of arguments to make-vector" info handler fail))
+      (else (k2 (apply make-vector args) fail)))))
 
 ;; error
 (define error-prim
@@ -2538,6 +2673,18 @@
        (k2 *use-stack-trace* fail))
       (else
        (runtime-error "use-stack-trace requires exactly one boolean or nothing" info handler fail)))))
+
+(define use-jit-prim
+  (lambda-proc (args env2 info handler fail k2)
+    (cond
+      ((and (length-one? args) (boolean? (car args)))
+       (begin
+	 (set-use-jit! (car args))
+	 (k2 void-value fail)))
+      ((null? args)
+       (k2 *use-jit* fail))
+      (else
+       (runtime-error "use-jit requires exactly one boolean or nothing" info handler fail)))))
 
 (define use-tracing-prim
   (lambda-proc (args env2 info handler fail k2)
@@ -2993,6 +3140,7 @@
 	    (list 'unbox unbox-prim "(unbox BOX): return the contents of BOX")
 	    (list 'unparse unparse-prim "(unparse AST): ")
 	    (list 'unparse-procedure unparse-procedure-prim "(unparse-procedure ...): ")  ;; unparse should be in CPS
+	    (list 'use-jit use-jit-prim "(use-jit [BOOLEAN]): get Phase-2/JIT usage setting, or set it on/off if BOOLEAN is given")
 	    (list 'use-lexical-address use-lexical-address-prim "(use-lexical-address [BOOLEAN]): get lexical-address setting, or set it on/off if BOOLEAN is given")
 	    (list 'use-stack-trace use-stack-trace-prim "(use-stack-trace BOOLEAN): set stack-trace usage on/off")
 	    (list 'use-tracing use-tracing-prim "(use-tracing [BOOLEAN]): get tracing setting, or set it on/off if BOOLEAN is given")
